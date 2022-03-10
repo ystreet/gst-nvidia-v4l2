@@ -4,6 +4,7 @@
  *               2006 Edgard Lima <edgard.lima@gmail.com>
  *               2009 Texas Instruments, Inc - http://www.ti.com/
  * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022 Matthew Waters <matthew@centricular.com>
  *
  * gstv4l2bufferpool.c V4L2 buffer pool class
  *
@@ -2032,6 +2033,81 @@ cleanup:
   }
 }
 
+#ifdef USE_V4L2_TARGET_NV
+static gboolean
+set_v4l2_video_mpeg_class_enable_roi (GstV4l2Object * v4l2object,
+    gboolean enable)
+{
+  struct v4l2_ext_control control;
+  struct v4l2_ext_controls ctrls;
+  v4l2_enc_enable_roi_param params;
+  gint ret;
+
+  if (!GST_V4L2_IS_OPEN (v4l2object)) {
+    g_print ("V4L2 device is not open\n");
+    return FALSE;
+  }
+
+  memset (&control, 0, sizeof (control));
+  memset (&ctrls, 0, sizeof (ctrls));
+
+  ctrls.count = 1;
+  ctrls.controls = &control;
+  ctrls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
+
+  params.bEnableROI = !(!enable);
+
+  control.id = V4L2_CID_MPEG_VIDEOENC_ENABLE_ROI_PARAM;
+  control.ptr = &params;
+
+  ret = v4l2object->ioctl (v4l2object->video_fd, VIDIOC_S_EXT_CTRLS, &ctrls);
+  if (ret < 0) {
+    g_print ("Error while setting IOCTL\n");
+    if (errno == EINVAL)
+      g_print ("Invalid control\n");
+
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean
+set_v4l2_video_mpeg_class_roi (GstV4l2Object * v4l2object,
+    v4l2_enc_frame_ROI_params * params)
+{
+  struct v4l2_ext_control control;
+  struct v4l2_ext_controls ctrls;
+  gint ret;
+
+  if (!GST_V4L2_IS_OPEN (v4l2object)) {
+    g_print ("V4L2 device is not open\n");
+    return FALSE;
+  }
+
+  memset (&control, 0, sizeof (control));
+  memset (&ctrls, 0, sizeof (ctrls));
+
+  ctrls.count = 1;
+  ctrls.controls = &control;
+  ctrls.ctrl_class = V4L2_CTRL_CLASS_MPEG;
+
+  control.id = V4L2_CID_MPEG_VIDEOENC_ROI_PARAMS;
+  control.ptr = params;
+
+  ret = v4l2object->ioctl (v4l2object->video_fd, VIDIOC_S_EXT_CTRLS, &ctrls);
+  if (ret < 0) {
+    g_print ("Error while setting IOCTL\n");
+    if (errno == EINVAL)
+      g_print ("Invalid control\n");
+
+    return FALSE;
+  }
+
+  return TRUE;
+}
+#endif
+
 /**
  * gst_v4l2_buffer_pool_process:
  * @bpool: a #GstBufferPool
@@ -2254,6 +2330,66 @@ gst_v4l2_buffer_pool_process (GstV4l2BufferPool * pool, GstBuffer ** buf)
               goto prepare_failed;
             }
           }
+
+#ifdef USE_V4L2_TARGET_NV
+          {
+            GstMeta *meta;
+            gpointer iter_state = NULL;
+            v4l2_enc_frame_ROI_params roi_params;
+
+            memset (&roi_params, 0, sizeof (roi_params));
+
+            while ((meta =
+                gst_buffer_iterate_meta_filtered (*buf, &iter_state,
+                    GST_VIDEO_REGION_OF_INTEREST_META_API_TYPE))) {
+              GstVideoRegionOfInterestMeta *roi_meta;
+              GstStructure *param;
+              int delta_qp;
+
+              roi_meta = (GstVideoRegionOfInterestMeta *) meta;
+              param =
+                  gst_video_region_of_interest_meta_get_param (roi_meta,
+                  "roi/v4l2");
+              if (param && gst_structure_get_int (param, "delta-qp", &delta_qp)) {
+                v4l2_enc_ROI_param *roi_param =
+                    &roi_params.ROI_params[roi_params.num_ROI_regions];
+
+                roi_param->ROIRect.left = roi_meta->x;
+                roi_param->ROIRect.top = roi_meta->y;
+                roi_param->ROIRect.width = roi_meta->w;
+                roi_param->ROIRect.height = roi_meta->h;
+                roi_param->QPdelta = delta_qp;
+
+                roi_params.num_ROI_regions++;
+              }
+
+              if (roi_params.num_ROI_regions > V4L2_MAX_ROI_REGIONS) {
+                GST_WARNING_OBJECT (pool, "Too many ROI regions (>%u), "
+                    "further ROI not configured", V4L2_MAX_ROI_REGIONS);
+                break;
+              }
+            }
+            GST_DEBUG_OBJECT (pool, "have %u ROI regions",
+                roi_params.num_ROI_regions);
+
+            if (roi_params.num_ROI_regions > 0) {
+              GstV4l2MemoryGroup *to_queue_group = NULL;
+
+              if (!gst_v4l2_is_buffer_valid (to_queue, &to_queue_group, pool->obj->is_encode))
+                GST_ERROR_OBJECT (pool, "allocated buffer is not v4l2?!");
+
+              /* set the config_store value, nvidia-specific */
+              to_queue_group->buffer.reserved2 = to_queue_group->buffer.index;
+              roi_params.config_store = to_queue_group->buffer.index;
+
+              if (!set_v4l2_video_mpeg_class_enable_roi (pool->obj, TRUE)) {
+                GST_WARNING_OBJECT (pool, "Failed to enable ROI");
+              } else if (!set_v4l2_video_mpeg_class_roi (pool->obj, &roi_params)) {
+                GST_WARNING_OBJECT (pool, "Failed to set ROI params");
+              }
+            }
+          }
+#endif
 
           if ((ret = gst_v4l2_buffer_pool_qbuf (pool, to_queue)) != GST_FLOW_OK)
             goto queue_failed;
